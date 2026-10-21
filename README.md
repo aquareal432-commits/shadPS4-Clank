@@ -1,4 +1,8 @@
 
+[Description]
+A Fork of ShadPS4 that is for Ratchet & Clank (2016)
+
+
 [English]
 This is an fork of PS4 Emulator ShadPS4.
 This fork was made to run Ratchet & Clank (2016) Better on ShadPS4.
