@@ -307,7 +307,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                                                            BindingType binding,
                                                            ImageId cache_image_id,
                                                            ImageId merged_image_id) {
-    static constexpr u64 NUM_FRAMES_BEFORE_REMOVAL = 32;
+    static constexpr u64 NUM_FRAMES_BEFORE_REMOVAL = 120;
 
     auto& cache_image = slot_images[cache_image_id];
     const bool safe_to_delete =
@@ -1051,9 +1051,9 @@ void TextureCache::GarbageCollectImages() {
     const auto configure = [&](bool allow_aggressive) {
         pressured = total_used_memory >= pressure_gc_memory;
         aggresive = allow_aggressive && total_used_memory >= critical_gc_memory;
-        ticks_to_destroy = aggresive ? 160 : pressured ? 80 : 16;
+        ticks_to_destroy = aggresive ? 480 : pressured ? 240 : 120;
         ticks_to_destroy = std::min(ticks_to_destroy, gc_tick);
-        num_deletions = aggresive ? 40 : pressured ? 20 : 10;
+        num_deletions = aggresive ? 16 : pressured ? 8 : 4;
     };
     const auto clean_up = [&](Image& image) {
         if (num_deletions == 0) {
@@ -1152,9 +1152,9 @@ void TextureCache::GarbageCollectSamplers() {
     const auto configure = [&](bool allow_aggressive) {
         pressured = total_used_samplers >= pressure_gc_samplers;
         aggresive = allow_aggressive && total_used_samplers >= critical_gc_samplers;
-        ticks_to_destroy = aggresive ? 160 : pressured ? 80 : 16;
+        ticks_to_destroy = aggresive ? 480 : pressured ? 240 : 120;
         ticks_to_destroy = std::min(ticks_to_destroy, gc_tick);
-        num_deletions = aggresive ? 40 : pressured ? 20 : 10;
+        num_deletions = aggresive ? 16 : pressured ? 8 : 4;
     };
     const auto clean_up = [&](Sampler& sampler) {
         if (num_deletions == 0) {
