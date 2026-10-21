@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <utility>
 #include "common/adaptive_mutex.h"
 #include "common/assert.h"
@@ -68,21 +69,26 @@ struct PageManager::Impl {
         constexpr Core::MemoryPermission Update(PageOp write_op, bool update_write = true,
                                                 PageOp read_op = PageOp::None,
                                                 bool update_read = false) {
-            if (update_read) {
-                if (read_op == PageOp::Track) {
-                    ASSERT_MSG(num_read_watchers == 0, "Too many watchers");
-                } else if (read_op == PageOp::Untrack) {
-                    ASSERT_MSG(num_read_watchers > 0, "Not enough watchers");
+            // R&C fork: Ratchet & Clank constantly unmaps/remaps 64K direct memory chunks that
+            // the GPU side never saw, so watcher counts can get out of sync with the texture
+            // cache. Instead of asserting, saturate the counters so a stray Track/Untrack
+            // cannot kill the emulator.
+            const auto apply = [](u8& count, PageOp op) {
+                if (op == PageOp::Track) {
+                    if (count < 255) {
+                        ++count;
+                    }
+                } else if (op == PageOp::Untrack) {
+                    if (count > 0) {
+                        --count;
+                    }
                 }
-                num_read_watchers += std::to_underlying(read_op);
+            };
+            if (update_read) {
+                apply(num_read_watchers, read_op);
             }
             if (update_write) {
-                if (write_op == PageOp::Track) {
-                    ASSERT_MSG(num_write_watchers < 255, "Too many watchers");
-                } else if (write_op == PageOp::Untrack) {
-                    ASSERT_MSG(num_write_watchers > 0, "Not enough watchers");
-                }
-                num_write_watchers += std::to_underlying(write_op);
+                apply(num_write_watchers, write_op);
             }
             return Perms();
         }
@@ -102,7 +108,29 @@ struct PageManager::Impl {
     }
 
     virtual void OnUnmap(VAddr address, size_t size) {
-        // No-op
+        ResetPages(address, size);
+    }
+
+    // Drops all watcher state for a range whose backing memory no longer exists. Without this
+    // the stale counts survive a munmap and get inherited by whatever is mapped there next.
+    void ResetPages(VAddr address, size_t size) {
+        const u64 page_start = address >> PM_PAGE_BITS;
+        const u64 page_end = Common::DivCeil(address + size, PM_PAGE_SIZE);
+        for (u64 page = page_start; page != page_end; ++page) {
+            PageState* state = cached_pages.find(page);
+            if (!state) {
+                continue;
+            }
+            auto* lock = locks.find(page);
+            if (lock) {
+                lock->lock();
+            }
+            state->num_read_watchers = 0;
+            state->num_write_watchers = 0;
+            if (lock) {
+                lock->unlock();
+            }
+        }
     }
 
     virtual void Protect(VAddr address, size_t size, Core::MemoryPermission perms) = 0;
@@ -136,9 +164,13 @@ struct PageManager::Impl {
         const u64 aligned_addr = page_start << PM_PAGE_BITS;
         const u64 aligned_end = page_end << PM_PAGE_BITS;
         if (!rasterizer->IsMapped(aligned_addr, aligned_end - aligned_addr)) {
-            LOG_WARNING(Render,
-                        "Tracking memory region {:#x} - {:#x} which is not fully GPU mapped.",
-                        aligned_addr, aligned_end);
+            // R&C hits this constantly; only log the first few to keep the log (and perf) sane.
+            static std::atomic<u32> unmapped_warnings{0};
+            if (unmapped_warnings.fetch_add(1, std::memory_order_relaxed) < 16) {
+                LOG_WARNING(Render,
+                            "Tracking memory region {:#x} - {:#x} which is not fully GPU mapped.",
+                            aligned_addr, aligned_end);
+            }
             EnsurePages(aligned_addr, aligned_end);
         }
 
@@ -241,7 +273,7 @@ struct PageManager::Impl {
                     range_begin = base_page + page;
                     potential_pages = 1;
                 }
-                // Extend current rango up to potential range
+                // Extend current range up to potential range
                 range_pages = potential_pages;
             }
         }
@@ -324,11 +356,16 @@ public:
     }
 
     void OnUnmap(VAddr address, size_t size) override {
+        PageManager::Impl::OnUnmap(address, size);
         uffdio_range range;
         range.start = address;
         range.len = size;
         const int ret = ioctl(uffd, UFFDIO_UNREGISTER, &range);
-        ASSERT_MSG(ret != -1, "Uffdio unregister failed with error: {}", Common::GetLastErrorMsg());
+        if (ret == -1) {
+            // R&C fork: non-fatal, the range may already be gone.
+            LOG_WARNING(Common_Memory, "Uffdio unregister failed with error: {}",
+                        Common::GetLastErrorMsg());
+        }
     }
 
     void Protect(VAddr address, size_t size, Core::MemoryPermission perms) override {
