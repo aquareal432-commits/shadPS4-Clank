@@ -22,6 +22,37 @@
 
 namespace Vulkan {
 
+namespace {
+
+// ---- Ratchet & Clank fork tuning knobs -------------------------------------------------------
+// Each switch is independent, so a regression can be bisected by flipping one at a time.
+
+// Guest LDS is not zero-initialised on GCN hardware, so zero-filling the host-side LDS backing
+// store on every dispatch (SharedMemSize * NumWorkgroups bytes of CPU writes) is pure overhead.
+constexpr bool kSkipLdsZeroFill = true;
+
+// Scheduler::PopPendingOperations() locks a mutex and queries the timeline semaphore. Doing it on
+// every draw/dispatch is wasteful; it also runs on every submit, so deferred callbacks are only
+// delayed by a few draws. Set to 1 to restore the original behaviour.
+constexpr u32 kPendingOpsPollInterval = 8;
+
+// Sampled (read-only) images only need to be visible to the stages of the pipeline that binds
+// them, not to ALL_COMMANDS. A narrower dst stage also narrows the src stage of the next barrier
+// on that image, so later barriers wait on less work.
+constexpr bool kNarrowSampledImageStages = true;
+
+// Command processing happens on the GPU thread; thread_local keeps this correct regardless.
+thread_local u32 pending_ops_poll_counter = 0;
+thread_local bool binding_compute_pipeline = false;
+
+void PollPendingOps(Scheduler& scheduler) {
+    if ((pending_ops_poll_counter++ % kPendingOpsPollInterval) == 0) {
+        scheduler.PopPendingOperations();
+    }
+}
+
+} // namespace
+
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
     // is encountered and implemented in the recompiler.
@@ -184,7 +215,7 @@ void Rasterizer::EliminateFastClear() {
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
 
-    scheduler.PopPendingOperations();
+    PollPendingOps(scheduler);
 
     if (!FilterDraw()) {
         return;
@@ -239,7 +270,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                               u16 instance_sgpr_offset) {
     RENDERER_TRACE;
 
-    scheduler.PopPendingOperations();
+    PollPendingOps(scheduler);
 
     if (!FilterDraw()) {
         return;
@@ -319,7 +350,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 void Rasterizer::DispatchDirect() {
     RENDERER_TRACE;
 
-    scheduler.PopPendingOperations();
+    PollPendingOps(scheduler);
 
     const auto& cs_program = liverpool->GetCsRegs();
     const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
@@ -354,7 +385,7 @@ void Rasterizer::DispatchDirect() {
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     RENDERER_TRACE;
 
-    scheduler.PopPendingOperations();
+    PollPendingOps(scheduler);
 
     const auto& cs_program = liverpool->GetCsRegs();
     const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
@@ -412,6 +443,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         IsComputeImageClear(pipeline)) {
         return false;
     }
+
+    binding_compute_pipeline = pipeline->IsCompute();
 
     set_write_index = 0;
     set_writes.clear();
@@ -802,8 +835,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 auto& lds_buffer = buffer_cache.GetStreamBuffer();
                 const auto& cs_program = liverpool->GetCsRegs();
                 const auto lds_size = cs_program.SharedMemSize() * cs_program.NumWorkgroups();
-                const auto [data, offset] = lds_buffer.Map(lds_size, alignment);
-                std::memset(data, 0, lds_size);
+                [[maybe_unused]] const auto [data, offset] = lds_buffer.Map(lds_size, alignment);
+                if constexpr (!kSkipLdsZeroFill) {
+                    std::memset(data, 0, lds_size);
+                }
                 lds_buffer.Commit();
                 buffer_infos.emplace_back(lds_buffer.Handle(), offset, lds_size);
             } else {
@@ -962,9 +997,13 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                     const auto new_layout = image.info.props.is_depth
                                                 ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
                                                 : vk::ImageLayout::eShaderReadOnlyOptimal;
-                    needs_barrier |= runtime.Transit(
-                        &image, new_layout, vk::PipelineStageFlagBits2::eAllCommands,
-                        vk::AccessFlagBits2::eShaderRead, desc.view_info.range);
+                    const auto sampled_stage =
+                        !kNarrowSampledImageStages ? vk::PipelineStageFlagBits2::eAllCommands
+                        : binding_compute_pipeline ? vk::PipelineStageFlagBits2::eComputeShader
+                                                   : vk::PipelineStageFlagBits2::eAllGraphics;
+                    needs_barrier |=
+                        runtime.Transit(&image, new_layout, sampled_stage,
+                                        vk::AccessFlagBits2::eShaderRead, desc.view_info.range);
                 }
             }
             image.usage.storage |= is_storage;
